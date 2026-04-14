@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+httpx
+requests
+anthropic
+assemblyai
+python-dotenv
+python-dateutil

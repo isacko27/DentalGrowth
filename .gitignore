@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+_temp_videos/
+sesiones_ig/
+ig_accounts_oauth.json
+clientes_ig.json
+ssl_cert.pem
+ssl_key.pem
+.DS_Store
+*.log
