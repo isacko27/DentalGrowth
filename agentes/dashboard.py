@@ -1146,13 +1146,17 @@ function formatMsg(text) {
 # PUNTO DE ENTRADA
 # ============================================================
 
-DASHBOARD_PORT = 8000
+DASHBOARD_PORT = int(os.environ.get("PORT", 8000))
 
 if __name__ == "__main__":
     print("🦷 Dashboard Dental Growth iniciando en puerto", DASHBOARD_PORT)
-    print("🔒 Abrí https://localhost:8000 en tu navegador")
-    uvicorn.run(
-        app, host="0.0.0.0", port=DASHBOARD_PORT,
-        ssl_keyfile=os.path.join(AGENTS_DIR, "ssl_key.pem"),
-        ssl_certfile=os.path.join(AGENTS_DIR, "ssl_cert.pem"),
-    )
+    ssl_key = os.path.join(AGENTS_DIR, "ssl_key.pem")
+    ssl_cert = os.path.join(AGENTS_DIR, "ssl_cert.pem")
+    kwargs = {"host": "0.0.0.0", "port": DASHBOARD_PORT}
+    if os.path.exists(ssl_key) and os.path.exists(ssl_cert):
+        kwargs["ssl_keyfile"] = ssl_key
+        kwargs["ssl_certfile"] = ssl_cert
+        print("🔒 Abrí https://localhost:8000 en tu navegador")
+    else:
+        print("🌐 Abrí http://localhost:8000 en tu navegador")
+    uvicorn.run(app, **kwargs)
