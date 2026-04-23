@@ -311,7 +311,7 @@ def _execute_tool(name, input_data):
             try:
                 # Transcribir
                 r1 = httpx.post("http://localhost:8002/transcribir",
-                                json={"url": video_url, "language": "es"}, timeout=120)
+                                json={"url": video_url, "language": "es"}, timeout=300)
                 if r1.status_code != 200:
                     return {"task": task_name, "status": "error", "detail": f"Transcripción falló: {r1.status_code}"}
                 transcripcion = r1.json().get("text", "")
@@ -462,6 +462,92 @@ def _sse_event(event_type, data):
     return f"event: {event_type}\ndata: {payload}\n\n"
 
 
+def _execute_tool_with_heartbeat(name, input_data):
+    """Ejecuta una herramienta en un thread y devuelve resultado + heartbeats SSE."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import queue
+
+    result_queue = queue.Queue()
+
+    def run():
+        try:
+            r = _execute_tool(name, input_data)
+            result_queue.put(("ok", r))
+        except Exception as e:
+            result_queue.put(("error", str(e)))
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(run)
+
+    # Mandar heartbeats cada 10 segundos mientras la herramienta trabaja
+    while not future.done():
+        try:
+            future.result(timeout=10)
+        except Exception:
+            pass
+        if not future.done():
+            yield _sse_event("heartbeat", {"text": f"⏳ Procesando {name}..."})
+
+    executor.shutdown(wait=False)
+
+    status, data = result_queue.get()
+    if status == "error":
+        yield _sse_event("agent_response", {"agent": name, "response": f"Error: {data}"})
+        yield ("__RESULT__", {"error": data})
+    else:
+        yield ("__RESULT__", data)
+
+
+def _get_tool_label(block):
+    """Genera el evento SSE de notificación para una herramienta."""
+    if block.name == "api_call":
+        method = block.input.get("method", "")
+        url = block.input.get("url", "")
+        agent_label = "API"
+        for aname, aurl in AGENT_URLS.items():
+            if aurl in url:
+                agent_label = AGENT_NAMES.get(aname, aname)
+                break
+        path = url.split("localhost:")[1].split("/", 1)[1] if "localhost:" in url else url
+        return _sse_event("agent_call", {"agent": agent_label, "question": f"{method} /{path}"})
+    elif block.name == "ask_agent":
+        agent_name = AGENT_NAMES.get(block.input.get("agent", ""), block.input.get("agent", ""))
+        return _sse_event("agent_call", {"agent": f"{agent_name} (IA)", "question": block.input.get("question", "")})
+    elif block.name == "get_oauth_accounts":
+        return _sse_event("agent_call", {"agent": "OAuth", "question": "Consultando cuentas conectadas..."})
+    elif block.name == "generate_copies":
+        c = block.input.get("cliente", "")
+        m = block.input.get("mes", "todos los meses")
+        return _sse_event("agent_call", {"agent": "Generador de Copies", "question": f"Buscando tareas de {c} ({m}), transcribiendo, generando y guardando copies en paralelo..."})
+    elif block.name == "upload_reel_oauth":
+        return _sse_event("agent_call", {"agent": "Instagram Upload", "question": f"Subiendo reel a @{block.input.get('username', '')}..."})
+    else:
+        return _sse_event("agent_call", {"agent": block.name, "question": "Procesando..."})
+
+
+def _get_tool_response_event(block, result):
+    """Genera el evento SSE de respuesta para una herramienta."""
+    if block.name == "ask_agent":
+        agent_name = AGENT_NAMES.get(block.input.get("agent", ""), "")
+        response_text = result.get("response", str(result))
+        if len(response_text) > 300:
+            response_text = response_text[:300] + "..."
+        return _sse_event("agent_response", {"agent": agent_name, "response": response_text})
+    elif block.name == "api_call":
+        return _sse_event("agent_response", {"agent": "API", "response": str(result)[:200]})
+    elif block.name == "generate_copies":
+        ok = result.get("exitosos", 0)
+        sin = result.get("sin_copy", 0)
+        return _sse_event("agent_response", {"agent": "Generador de Copies", "response": f"{ok}/{sin} copies generados y guardados en ClickUp"})
+    elif block.name == "upload_reel_oauth":
+        if result.get("success"):
+            return _sse_event("agent_response", {"agent": "Instagram", "response": f"Reel publicado en @{result.get('username', '')}"})
+        else:
+            return _sse_event("agent_response", {"agent": "Instagram", "response": f"Error: {result.get('error', str(result))}"})
+    else:
+        return _sse_event("agent_response", {"agent": block.name, "response": str(result)[:200]})
+
+
 def _chat_stream(message: str):
     """Generador SSE que procesa el chat con tool use."""
     chat_history.append({"role": "user", "content": message})
@@ -477,7 +563,8 @@ def _chat_stream(message: str):
                 max_tokens=2000,
                 system=SYSTEM_PROMPT,
                 tools=TOOLS,
-                messages=messages
+                messages=messages,
+                timeout=600,
             )
 
             # Si terminó sin tool use
@@ -500,68 +587,22 @@ def _chat_stream(message: str):
                 tool_results = []
                 for block in response.content:
                     if block.type == "tool_use":
-                        # Notificar qué se está haciendo
-                        if block.name == "api_call":
-                            method = block.input.get("method", "")
-                            url = block.input.get("url", "")
-                            # Extraer nombre del agente de la URL
-                            agent_label = "API"
-                            for aname, aurl in AGENT_URLS.items():
-                                if aurl in url:
-                                    agent_label = AGENT_NAMES.get(aname, aname)
-                                    break
-                            path = url.split("localhost:")[1].split("/", 1)[1] if "localhost:" in url else url
-                            yield _sse_event("agent_call", {
-                                "agent": agent_label,
-                                "question": f"{method} /{path}"
-                            })
-                        elif block.name == "ask_agent":
-                            agent_name = AGENT_NAMES.get(block.input.get("agent", ""), block.input.get("agent", ""))
-                            yield _sse_event("agent_call", {
-                                "agent": f"{agent_name} (IA)",
-                                "question": block.input.get("question", "")
-                            })
-                        elif block.name == "get_oauth_accounts":
-                            yield _sse_event("agent_call", {"agent": "OAuth", "question": "Consultando cuentas conectadas..."})
-                        elif block.name == "download_video":
-                            yield _sse_event("agent_call", {"agent": "Descarga", "question": f"Descargando video: {block.input.get('filename', '')}"})
-                        elif block.name == "generate_copies":
-                            c = block.input.get("cliente", "")
-                            m = block.input.get("mes", "todos los meses")
-                            yield _sse_event("agent_call", {"agent": "Generador de Copies", "question": f"Buscando tareas de {c} ({m}), transcribiendo, generando y guardando copies en paralelo..."})
-                        elif block.name == "upload_reel_oauth":
-                            yield _sse_event("agent_call", {"agent": "Instagram Upload", "question": f"Subiendo reel a @{block.input.get('username', '')}..."})
-                        elif block.name == "cleanup_video":
-                            yield _sse_event("agent_call", {"agent": "Limpieza", "question": "Eliminando video temporal..."})
+                        # Notificar qué herramienta se está ejecutando
+                        yield _get_tool_label(block)
 
-                        result = _execute_tool(block.name, block.input)
+                        # Ejecutar con heartbeat para mantener la conexión viva
+                        result = None
+                        for event in _execute_tool_with_heartbeat(block.name, block.input):
+                            if isinstance(event, tuple) and event[0] == "__RESULT__":
+                                result = event[1]
+                            else:
+                                yield event
+
+                        if result is None:
+                            result = {"error": "No se obtuvo resultado"}
 
                         # Notificar respuesta
-                        if block.name == "ask_agent":
-                            agent_name = AGENT_NAMES.get(block.input.get("agent", ""), "")
-                            response_text = result.get("response", str(result))
-                            if len(response_text) > 300:
-                                response_text = response_text[:300] + "..."
-                            yield _sse_event("agent_response", {"agent": agent_name, "response": response_text})
-                        elif block.name == "api_call":
-                            summary = str(result)[:200]
-                            yield _sse_event("agent_response", {"agent": "API", "response": summary})
-                        elif block.name == "download_video":
-                            if "path" in result:
-                                yield _sse_event("agent_response", {"agent": "Descarga", "response": f"Listo: {result.get('size_mb', '?')} MB"})
-                            else:
-                                yield _sse_event("agent_response", {"agent": "Descarga", "response": str(result)})
-                        elif block.name == "generate_copies":
-                            ok = result.get("exitosos", 0)
-                            sin = result.get("sin_copy", 0)
-                            yield _sse_event("agent_response", {"agent": "Generador de Copies", "response": f"{ok}/{sin} copies generados y guardados en ClickUp"})
-                        elif block.name == "upload_reel_oauth":
-                            if result.get("success"):
-                                yield _sse_event("agent_response", {"agent": "Instagram", "response": f"Reel publicado en @{result.get('username', '')}"})
-                            else:
-                                yield _sse_event("agent_response", {"agent": "Instagram", "response": f"Error: {result.get('error', str(result))}"})
-                        elif block.name == "cleanup_video":
-                            yield _sse_event("agent_response", {"agent": "Limpieza", "response": "Archivo temporal eliminado"})
+                        yield _get_tool_response_event(block, result)
 
                         result_str = json.dumps(result, ensure_ascii=False, default=str)
                         if len(result_str) > 8000:
@@ -1097,6 +1138,8 @@ function handleSSE(statusId, eventType, data) {
     appendStatusItem(statusId, 'agent_call', `📡 Consultando a **${data.agent}**: ${data.question}`);
   } else if (eventType === 'agent_response') {
     appendStatusItem(statusId, 'agent_response', `✅ **${data.agent}** respondió: ${data.response}`);
+  } else if (eventType === 'heartbeat') {
+    appendStatusItem(statusId, 'thinking', data.text);
   } else if (eventType === 'done') {
     // Reemplazar la burbuja de estado con la respuesta final
     const el = document.getElementById(statusId);
