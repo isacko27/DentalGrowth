@@ -968,7 +968,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 
 <script>
-const CM_URL = 'http://localhost:8004';
 const DASH_URL = '';
 
 const AGENT_INFO = {
