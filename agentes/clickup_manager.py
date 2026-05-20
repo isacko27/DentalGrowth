@@ -178,6 +178,50 @@ def _clickup_put(url, body):
     response.raise_for_status()
     return response.json()
 
+import time as _time
+_video_lists_cache = {"data": None, "timestamp": 0}
+
+def _get_video_lists_dinamico():
+    """Descubre todas las listas del espacio Videos dinámicamente.
+    Cachea por 5 minutos para no quemar la API.
+    Combina con las hardcodeadas en WORKSPACE como fallback.
+    """
+    now = _time.time()
+    if _video_lists_cache["data"] and (now - _video_lists_cache["timestamp"]) < 300:
+        return _video_lists_cache["data"]
+
+    videos_space_id = WORKSPACE["spaces"]["videos"]["id"]
+    resultado = {}
+
+    # 1. Listas en folders del espacio Videos
+    try:
+        folders = _clickup_get(f"https://api.clickup.com/api/v2/space/{videos_space_id}/folder").get("folders", [])
+        for f in folders:
+            for l in f.get("lists", []):
+                name = l["name"].lower().strip().replace(" ", "_")
+                resultado[name] = l["id"]
+    except Exception:
+        pass
+
+    # 2. Listas sin folder (folderless)
+    try:
+        lists = _clickup_get(f"https://api.clickup.com/api/v2/space/{videos_space_id}/list").get("lists", [])
+        for l in lists:
+            name = l["name"].lower().strip().replace(" ", "_")
+            resultado[name] = l["id"]
+    except Exception:
+        pass
+
+    # 3. Fallback: las hardcodeadas en WORKSPACE (por si la API falla)
+    for k, v in WORKSPACE["video_lists"].items():
+        if k not in resultado:
+            resultado[k] = v
+
+    _video_lists_cache["data"] = resultado
+    _video_lists_cache["timestamp"] = now
+    return resultado
+
+
 def _buscar_cliente(nombre):
     """Busca un cliente por nombre (match flexible)."""
     nombre_lower = nombre.lower().strip()
@@ -294,16 +338,19 @@ def buscar_tareas_cliente(cliente: str, mes: Optional[str] = None, con_video: bo
     import re
     cliente_lower = cliente.lower().strip()
 
+    # Descubrir listas dinámicamente desde ClickUp
+    todas_las_listas = _get_video_lists_dinamico()
+
     # Determinar en qué listas buscar
     listas_a_buscar = {}
     if mes:
         mes_lower = mes.lower().strip()
-        for key, lid in WORKSPACE["video_lists"].items():
+        for key, lid in todas_las_listas.items():
             if mes_lower in key:
                 listas_a_buscar[key] = lid
     if not listas_a_buscar:
         # Buscar en todas, más reciente primero
-        listas_a_buscar = dict(reversed(list(WORKSPACE["video_lists"].items())))
+        listas_a_buscar = dict(reversed(list(todas_las_listas.items())))
 
     resultados = []
     for mes_key, list_id in listas_a_buscar.items():
@@ -361,6 +408,71 @@ def buscar_tareas_cliente(cliente: str, mes: Optional[str] = None, con_video: bo
         "resultados": resultados,
         "total": len(resultados),
         "listas_buscadas": list(listas_a_buscar.keys()),
+    }
+
+
+@app.get("/videos-listos-sin-copy")
+def videos_listos_sin_copy(cliente: Optional[str] = None):
+    """Encuentra TODAS las tareas (en todos los meses, dinámicamente) que tienen
+    video subido por el editor pero todavía no tienen copy generado.
+
+    Si pasás ?cliente=X filtra por ese cliente. Si no, devuelve todos los pendientes.
+    Esta es la fuente única de verdad para "qué videos están listos para hacer copy".
+    """
+    todas = _get_video_lists_dinamico()
+    pendientes = []
+
+    for mes_key, list_id in todas.items():
+        try:
+            data = _clickup_get(
+                f"https://api.clickup.com/api/v2/list/{list_id}/task",
+                params={"include_closed": "true"}
+            )
+        except Exception:
+            continue
+
+        for t in data.get("tasks", []):
+            nombre_tarea = t["name"]
+            if cliente:
+                cliente_lower = cliente.lower().strip()
+                if cliente_lower not in nombre_tarea.lower():
+                    palabras = cliente_lower.split()
+                    if not all(p in nombre_tarea.lower() for p in palabras):
+                        continue
+
+            # ¿Ya tiene copy?
+            tiene_copy = False
+            for cf in t.get("custom_fields", []):
+                if cf.get("id") == WORKSPACE["custom_fields"]["tema"] and cf.get("value"):
+                    tiene_copy = True
+                    break
+            if tiene_copy:
+                continue
+
+            # ¿Tiene video del editor?
+            try:
+                comentarios = _clickup_get(
+                    f"https://api.clickup.com/api/v2/task/{t['id']}/comment"
+                ).get("comments", [])
+                video = _buscar_video_en_comentarios(comentarios)
+                if not video:
+                    continue
+            except Exception:
+                continue
+
+            pendientes.append({
+                "task_id": t["id"],
+                "nombre": nombre_tarea,
+                "cliente": _extraer_nombre_cliente(nombre_tarea),
+                "mes": mes_key,
+                "status": t.get("status", {}).get("status", ""),
+                "video": video,
+            })
+
+    return {
+        "total": len(pendientes),
+        "listas_buscadas": list(todas.keys()),
+        "pendientes": pendientes,
     }
 
 

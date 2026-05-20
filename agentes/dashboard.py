@@ -140,10 +140,18 @@ SYSTEM_PROMPT = """Sos el orquestador central de Dental Growth, una agencia de m
   SIEMPRE se pone fecha límite = inicio + 3 meses en ambas listas.
 - GET /admin/resumen/{cliente} — resumen completo: pagos + tareas + entregas + info negocio
 
-## FLUJO: GENERAR COPIES — UN SOLO PASO
-- Usá generate_copies con el nombre del cliente y mes. Ejemplo: generate_copies(cliente="dentium", mes="enero")
-- La herramienta AUTOMÁTICAMENTE: busca tareas sin copy → obtiene videos → transcribe → genera copies → los guarda en el campo tema de ClickUp.
-- NUNCA hagas transcripciones ni copies manualmente con api_call. SIEMPRE usá generate_copies.
+## FLUJO: GENERAR COPIES — UN SOLO PASO (BÚSQUEDA DINÁMICA)
+La herramienta generate_copies descubre AUTOMÁTICAMENTE todas las listas mensuales del espacio Videos en ClickUp (no necesita configuración manual). Modos:
+
+1. **Sin parámetros** → `generate_copies()` → procesa TODOS los videos listos sin copy de TODOS los clientes en TODOS los meses. Ideal para "haceme todos los copies pendientes".
+2. **Solo cliente** → `generate_copies(cliente="dentium")` → todos los meses de ese cliente.
+3. **Cliente + mes** → `generate_copies(cliente="smile pro", mes="abril")` → un mes específico.
+
+La herramienta hace TODO: busca tareas sin copy → obtiene videos → transcribe → genera copies → los guarda en el campo tema de ClickUp. NUNCA hagas transcripciones ni copies manualmente con api_call.
+
+Endpoint útil para chequear sin generar:
+- GET /videos-listos-sin-copy → lista todos los videos listos sin copy (en todos los meses dinámicamente)
+- GET /videos-listos-sin-copy?cliente=X → filtrado por cliente
 
 ## FLUJO: SUBIR VIDEO A INSTAGRAM
 1. api_call GET /buscar/{cliente}?con_video=true → tareas con video y copy
@@ -176,14 +184,13 @@ TOOLS = [
     },
     {
         "name": "generate_copies",
-        "description": "Busca tareas sin copy de un cliente, transcribe sus videos, genera copies y los guarda en ClickUp. TODO AUTOMÁTICO EN PARALELO. Solo necesitás el nombre del cliente y el mes.",
+        "description": "Genera copies de Instagram para videos que están listos en ClickUp. Descubre las listas de videos AUTOMÁTICAMENTE (no necesita config). Sin parámetros: procesa TODOS los videos listos sin copy. Con cliente: filtra ese cliente. Con cliente+mes: filtra ese mes. Hace TODO en paralelo: busca, transcribe, genera, guarda.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "cliente": {"type": "string", "description": "Nombre del cliente (ej: dentium, smile pro)"},
-                "mes": {"type": "string", "description": "Mes a buscar (ej: enero, febrero, marzo, abril). Opcional."}
-            },
-            "required": ["cliente"]
+                "cliente": {"type": "string", "description": "Nombre del cliente (opcional). Si no se pasa, procesa todos los clientes con videos pendientes."},
+                "mes": {"type": "string", "description": "Mes a buscar (ej: enero, mayo). Opcional."}
+            }
         }
     },
     {
@@ -267,36 +274,59 @@ def _execute_tool(name, input_data):
             return {"error": str(e)}
 
     elif name == "generate_copies":
-        cliente = input_data["cliente"]
+        cliente = input_data.get("cliente")  # opcional ahora
         mes = input_data.get("mes")
         tema_field_id = "7dbf2727-6615-49fa-aa4c-2de3069b0000"
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        # Paso 1: Buscar tareas con video + info del negocio en paralelo
-        def fetch_tasks():
-            params = f"?con_video=true"
-            if mes:
-                params += f"&mes={mes}"
-            return httpx.get(f"http://localhost:8001/buscar/{cliente}{params}", timeout=30).json()
+        # Usar el endpoint inteligente que descubre dinámicamente todos los videos listos sin copy
+        if not cliente and not mes:
+            # Modo "todos los pendientes"
+            r = httpx.get("http://localhost:8001/videos-listos-sin-copy", timeout=60)
+            data = r.json()
+            sin_copy = data.get("pendientes", [])
+            # Agrupar por cliente para fetch_info
+            clientes_unicos = list({t["cliente"] for t in sin_copy})
+            info_por_cliente = {}
+            with ThreadPoolExecutor(max_workers=min(6, max(1, len(clientes_unicos)))) as ex:
+                future_map = {ex.submit(lambda c: httpx.get(f"http://localhost:8001/cliente/{c}/info", timeout=15).json(), c): c for c in clientes_unicos}
+                for fut in as_completed(future_map):
+                    c = future_map[fut]
+                    try:
+                        info_por_cliente[c] = fut.result().get("info", f"Cliente: {c}")
+                    except Exception:
+                        info_por_cliente[c] = f"Cliente: {c}"
+        else:
+            # Modo "un cliente específico"
+            def fetch_tasks():
+                if cliente:
+                    params = f"?con_video=true"
+                    if mes:
+                        params += f"&mes={mes}"
+                    return httpx.get(f"http://localhost:8001/buscar/{cliente}{params}", timeout=30).json()
+                else:
+                    return httpx.get(f"http://localhost:8001/videos-listos-sin-copy?mes={mes}" if mes else "http://localhost:8001/videos-listos-sin-copy", timeout=60).json()
 
-        def fetch_info():
-            return httpx.get(f"http://localhost:8001/cliente/{cliente}/info", timeout=15).json()
+            def fetch_info():
+                if cliente:
+                    return httpx.get(f"http://localhost:8001/cliente/{cliente}/info", timeout=15).json()
+                return {}
 
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            f_tasks = ex.submit(fetch_tasks)
-            f_info = ex.submit(fetch_info)
-            tasks_data = f_tasks.result()
-            info_data = f_info.result()
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                f_tasks = ex.submit(fetch_tasks)
+                f_info = ex.submit(fetch_info)
+                tasks_data = f_tasks.result()
+                info_data = f_info.result()
 
-        all_tasks = tasks_data.get("resultados", [])
-        sin_copy = [t for t in all_tasks if not t.get("tiene_copy")]
+            all_tasks = tasks_data.get("resultados", tasks_data.get("pendientes", []))
+            sin_copy = [t for t in all_tasks if not t.get("tiene_copy", False)] if "resultados" in tasks_data else all_tasks
+
+            info_por_cliente = {cliente: info_data.get("info", f"Cliente: {cliente}")} if cliente else {}
 
         if not sin_copy:
-            return {"message": f"Todas las tareas de {cliente} ya tienen copy.", "total": len(all_tasks), "sin_copy": 0}
-
-        nombre_cliente = cliente.title()
-        info_negocio = info_data.get("info", f"Cliente: {nombre_cliente}")
+            target = cliente or "todos los clientes"
+            return {"message": f"No hay videos listos sin copy para {target}.", "total": 0, "sin_copy": 0}
 
         # Paso 2: Para cada tarea sin copy, transcribir → generar → guardar (en paralelo)
         def process_task(task):
@@ -304,6 +334,8 @@ def _execute_tool(name, input_data):
             task_name = task["nombre"]
             video = task.get("video", {})
             video_url = video.get("url") if isinstance(video, dict) else None
+            task_cliente = task.get("cliente") or (cliente if cliente else task_name)
+            task_info = info_por_cliente.get(task_cliente, f"Cliente: {task_cliente}")
 
             if not video_url:
                 return {"task": task_name, "status": "error", "detail": "Sin video URL"}
@@ -318,7 +350,7 @@ def _execute_tool(name, input_data):
 
                 # Generar copy
                 r2 = httpx.post("http://localhost:8003/generar",
-                                json={"transcripcion": transcripcion, "nombre_cliente": nombre_cliente, "info_negocio": info_negocio},
+                                json={"transcripcion": transcripcion, "nombre_cliente": task_cliente.title(), "info_negocio": task_info},
                                 timeout=60)
                 if r2.status_code != 200:
                     return {"task": task_name, "status": "error", "detail": f"Generación falló: {r2.status_code}"}
@@ -344,7 +376,7 @@ def _execute_tool(name, input_data):
 
         results.sort(key=lambda x: x.get("task", ""))
         ok_count = sum(1 for r in results if r["status"] == "ok")
-        return {"total_tareas": len(all_tasks), "sin_copy": len(sin_copy), "exitosos": ok_count, "resultados": results}
+        return {"sin_copy": len(sin_copy), "exitosos": ok_count, "resultados": results}
 
     elif name == "get_oauth_accounts":
         return _load_ig_accounts()
