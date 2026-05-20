@@ -38,6 +38,7 @@ WORKSPACE = {
         "febrero_2026": "901325190899",
         "marzo_2026": "901325940523",
         "abril_2026": "901326704541",
+        "mayo_2026": "901327032239",
     },
     "video_statuses": [
         "to do", "grabado", "en edicion",
