@@ -140,18 +140,25 @@ SYSTEM_PROMPT = """Sos el orquestador central de Dental Growth, una agencia de m
   SIEMPRE se pone fecha límite = inicio + 3 meses en ambas listas.
 - GET /admin/resumen/{cliente} — resumen completo: pagos + tareas + entregas + info negocio
 
-## FLUJO: GENERAR COPIES — UN SOLO PASO (BÚSQUEDA DINÁMICA)
-La herramienta generate_copies descubre AUTOMÁTICAMENTE todas las listas mensuales del espacio Videos en ClickUp (no necesita configuración manual). Modos:
+## FLUJO: GENERAR COPIES — CLIENTE POR CLIENTE (IMPORTANTE)
 
-1. **Sin parámetros** → `generate_copies()` → procesa TODOS los videos listos sin copy de TODOS los clientes en TODOS los meses. Ideal para "haceme todos los copies pendientes".
-2. **Solo cliente** → `generate_copies(cliente="dentium")` → todos los meses de ese cliente.
-3. **Cliente + mes** → `generate_copies(cliente="smile pro", mes="abril")` → un mes específico.
+**REGLA CRÍTICA**: en producción Railway corta conexiones largas, así que SIEMPRE procesá **un cliente a la vez**. Nunca llames generate_copies sin cliente — eso intenta procesar todos a la vez y se corta.
 
-La herramienta hace TODO: busca tareas sin copy → obtiene videos → transcribe → genera copies → los guarda en el campo tema de ClickUp. NUNCA hagas transcripciones ni copies manualmente con api_call.
+**Flujo correcto para "haceme los copies de mayo" o "haceme todos los pendientes":**
+1. Primero: `api_call GET /videos-listos-sin-copy?mes=mayo` (o sin mes para todos)
+2. Mirá qué clientes tienen videos pendientes (campo `cliente` en cada item)
+3. Para CADA cliente único, llamá `generate_copies(cliente="X", mes="mayo")` por separado
+4. Reportá los resultados de cada uno
 
-Endpoint útil para chequear sin generar:
-- GET /videos-listos-sin-copy → lista todos los videos listos sin copy (en todos los meses dinámicamente)
-- GET /videos-listos-sin-copy?cliente=X → filtrado por cliente
+**Flujo correcto para "haceme los copies de dentium":**
+- Una sola llamada: `generate_copies(cliente="dentium")`
+
+La herramienta descubre dinámicamente las listas del espacio Videos (no hay que actualizar config cuando abrís un mes nuevo). Para cada video hace: transcripción → copy → guardado en campo tema, todo en paralelo.
+
+**Endpoints útiles:**
+- GET /videos-listos-sin-copy → todos los pendientes
+- GET /videos-listos-sin-copy?mes=mayo → pendientes de un mes
+- GET /videos-listos-sin-copy?cliente=dentium → pendientes de un cliente
 
 ## FLUJO: SUBIR VIDEO A INSTAGRAM
 1. api_call GET /buscar/{cliente}?con_video=true → tareas con video y copy

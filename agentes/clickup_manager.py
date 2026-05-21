@@ -411,66 +411,103 @@ def buscar_tareas_cliente(cliente: str, mes: Optional[str] = None, con_video: bo
     }
 
 
+# Statuses donde el editor YA subió video (filtro inicial para evitar N+1 problem)
+VIDEO_READY_STATUSES = {
+    "en revision (agencia)", "pendiente de correccion",
+    "aprobado (agencia)", "en revision (cliente)",
+    "completado", "subido a campanas", "pagado",
+}
+
+
 @app.get("/videos-listos-sin-copy")
-def videos_listos_sin_copy(cliente: Optional[str] = None):
-    """Encuentra TODAS las tareas (en todos los meses, dinámicamente) que tienen
-    video subido por el editor pero todavía no tienen copy generado.
+def videos_listos_sin_copy(cliente: Optional[str] = None, mes: Optional[str] = None):
+    """Encuentra TODAS las tareas que tienen video subido por el editor pero todavía
+    no tienen copy generado. PARALELIZADO para que no sea lento con muchas tareas.
 
-    Si pasás ?cliente=X filtra por ese cliente. Si no, devuelve todos los pendientes.
-    Esta es la fuente única de verdad para "qué videos están listos para hacer copy".
+    Filtros opcionales:
+    - cliente: nombre del cliente (match flexible)
+    - mes: nombre del mes (ej "mayo")
     """
-    todas = _get_video_lists_dinamico()
-    pendientes = []
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    for mes_key, list_id in todas.items():
+    todas = _get_video_lists_dinamico()
+
+    if mes:
+        mes_lower = mes.lower().strip()
+        todas = {k: v for k, v in todas.items() if mes_lower in k.lower()}
+
+    # Paso 1: fetch tareas de cada lista en paralelo (no comentarios todavía)
+    def fetch_list(mes_key, list_id):
         try:
             data = _clickup_get(
                 f"https://api.clickup.com/api/v2/list/{list_id}/task",
                 params={"include_closed": "true"}
             )
+            return mes_key, data.get("tasks", [])
         except Exception:
-            continue
+            return mes_key, []
 
-        for t in data.get("tasks", []):
-            nombre_tarea = t["name"]
-            if cliente:
-                cliente_lower = cliente.lower().strip()
-                if cliente_lower not in nombre_tarea.lower():
-                    palabras = cliente_lower.split()
-                    if not all(p in nombre_tarea.lower() for p in palabras):
-                        continue
+    candidatos = []  # (mes_key, task) tuples que requieren chequeo de comentarios
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(todas)))) as ex:
+        futures = [ex.submit(fetch_list, mk, lid) for mk, lid in todas.items()]
+        for fut in as_completed(futures):
+            mes_key, tasks = fut.result()
+            for t in tasks:
+                nombre_tarea = t["name"]
+                if cliente:
+                    cliente_lower = cliente.lower().strip()
+                    if cliente_lower not in nombre_tarea.lower():
+                        palabras = cliente_lower.split()
+                        if not all(p in nombre_tarea.lower() for p in palabras):
+                            continue
 
-            # ¿Ya tiene copy?
-            tiene_copy = False
-            for cf in t.get("custom_fields", []):
-                if cf.get("id") == WORKSPACE["custom_fields"]["tema"] and cf.get("value"):
-                    tiene_copy = True
-                    break
-            if tiene_copy:
-                continue
-
-            # ¿Tiene video del editor?
-            try:
-                comentarios = _clickup_get(
-                    f"https://api.clickup.com/api/v2/task/{t['id']}/comment"
-                ).get("comments", [])
-                video = _buscar_video_en_comentarios(comentarios)
-                if not video:
+                # ¿Ya tiene copy?
+                tiene_copy = any(
+                    cf.get("id") == WORKSPACE["custom_fields"]["tema"] and cf.get("value")
+                    for cf in t.get("custom_fields", [])
+                )
+                if tiene_copy:
                     continue
-            except Exception:
-                continue
 
-            pendientes.append({
+                # Filtro por status: solo tareas donde el editor ya subió video
+                status = t.get("status", {}).get("status", "").lower()
+                if status not in VIDEO_READY_STATUSES:
+                    continue
+
+                candidatos.append((mes_key, t))
+
+    # Paso 2: chequeo de comentarios EN PARALELO (esto era el N+1 problem)
+    def check_video(mes_key, t):
+        try:
+            comentarios = _clickup_get(
+                f"https://api.clickup.com/api/v2/task/{t['id']}/comment"
+            ).get("comments", [])
+            video = _buscar_video_en_comentarios(comentarios)
+            if not video:
+                return None
+            return {
                 "task_id": t["id"],
-                "nombre": nombre_tarea,
-                "cliente": _extraer_nombre_cliente(nombre_tarea),
+                "nombre": t["name"],
+                "cliente": _extraer_nombre_cliente(t["name"]),
                 "mes": mes_key,
                 "status": t.get("status", {}).get("status", ""),
                 "video": video,
-            })
+            }
+        except Exception:
+            return None
+
+    pendientes = []
+    if candidatos:
+        with ThreadPoolExecutor(max_workers=min(15, len(candidatos))) as ex:
+            futures = [ex.submit(check_video, mk, t) for mk, t in candidatos]
+            for fut in as_completed(futures):
+                result = fut.result()
+                if result:
+                    pendientes.append(result)
 
     return {
         "total": len(pendientes),
+        "candidatos_chequeados": len(candidatos),
         "listas_buscadas": list(todas.keys()),
         "pendientes": pendientes,
     }
