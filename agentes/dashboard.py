@@ -652,8 +652,15 @@ def _chat_stream(message: str):
     chat_history.append({"role": "user", "content": message})
     messages = [{"role": m["role"], "content": m["content"]} for m in chat_history[-20:]]
 
+    # Cache de llamadas ya hechas EN ESTE turno. Si el modelo insiste con la misma
+    # herramienta y los mismos argumentos (tipico cuando un escaneo vuelve
+    # truncado), se le devuelve el resultado anterior al instante en vez de
+    # reejecutarlo: 10 iteraciones de un escaneo de 90s eran 15 minutos colgado y
+    # la conexion moria antes ("network error" en el browser).
+    ya_ejecutado = {}
+
     try:
-        max_iterations = 10
+        max_iterations = 6
         for _ in range(max_iterations):
             yield _sse_event("thinking", {"text": "Pensando..."})
 
@@ -690,15 +697,26 @@ def _chat_stream(message: str):
                         yield _get_tool_label(block)
 
                         # Ejecutar con heartbeat para mantener la conexión viva
-                        result = None
-                        for event in _execute_tool_with_heartbeat(block.name, block.input):
-                            if isinstance(event, tuple) and event[0] == "__RESULT__":
-                                result = event[1]
-                            else:
-                                yield event
+                        firma = (block.name, json.dumps(block.input, sort_keys=True, default=str))
+                        if firma in ya_ejecutado:
+                            result = dict(ya_ejecutado[firma]) if isinstance(ya_ejecutado[firma], dict) else ya_ejecutado[firma]
+                            if isinstance(result, dict):
+                                result["_nota"] = (
+                                    "Esta llamada ya se hizo en este mismo turno y devolvio "
+                                    "lo mismo. NO la repitas: usa este resultado, o cambia los "
+                                    "filtros (cliente/mes) si necesitas mas detalle."
+                                )
+                        else:
+                            result = None
+                            for event in _execute_tool_with_heartbeat(block.name, block.input):
+                                if isinstance(event, tuple) and event[0] == "__RESULT__":
+                                    result = event[1]
+                                else:
+                                    yield event
 
-                        if result is None:
-                            result = {"error": "No se obtuvo resultado"}
+                            if result is None:
+                                result = {"error": "No se obtuvo resultado"}
+                            ya_ejecutado[firma] = result
 
                         # Notificar respuesta
                         yield _get_tool_response_event(block, result)
