@@ -560,7 +560,7 @@ def _get_video_de_comentarios_cached(task_id):
 
 
 @app.get("/videos-listos-sin-copy")
-def videos_listos_sin_copy(cliente: Optional[str] = None, mes: Optional[str] = None, presupuesto_seg: float = 60.0):
+def videos_listos_sin_copy(cliente: Optional[str] = None, mes: Optional[str] = None, presupuesto_seg: float = 35.0):
     """Encuentra TODAS las tareas que tienen video subido por el editor pero todavía
     no tienen copy generado. PARALELIZADO para que no sea lento con muchas tareas.
 
