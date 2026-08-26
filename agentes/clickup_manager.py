@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from typing import Optional
 import requests
 import json
+import re
 import uvicorn
 from config import CLICKUP_API_KEY, CLICKUP_MANAGER_PORT
 from agent_brain import ask_agent
@@ -275,8 +276,15 @@ def _get_video_lists_dinamico():
     try:
         folders = _clickup_get(f"https://api.clickup.com/api/v2/space/{videos_space_id}/folder").get("folders", [])
         for f in folders:
+            # El espacio Videos agrupa las listas en carpetas por año (2025, 2026)
+            # y cada carpeta repite los mismos nombres de mes. Si la clave fuera
+            # solo el nombre de la lista, un año pisaba al otro y quedaba
+            # invisible. Se usa "mes_año", igual que las claves hardcodeadas.
+            carpeta = f["name"].lower().strip().replace(" ", "_")
             for l in f.get("lists", []):
                 name = l["name"].lower().strip().replace(" ", "_")
+                if re.fullmatch(r"20\d{2}", carpeta) and carpeta not in name:
+                    name = f"{name}_{carpeta}"
                 resultado[name] = l["id"]
     except Exception:
         pass
@@ -298,6 +306,32 @@ def _get_video_lists_dinamico():
     _video_lists_cache["data"] = resultado
     _video_lists_cache["timestamp"] = now
     return resultado
+
+
+def _filtrar_listas_por_mes(listas, mes):
+    """Filtra listas de video por mes.
+
+    Si no se especifica año, se queda con el más reciente: pedir "agosto" no
+    debe tocar los videos de agosto del año pasado.
+    """
+    if not mes:
+        return dict(listas)
+    tokens = [t for t in re.split(r"[\s_]+", mes.lower().strip()) if t]
+    if not tokens:
+        return dict(listas)
+
+    coinciden = {k: v for k, v in listas.items() if all(t in k for t in tokens)}
+    pidio_anio = any(re.fullmatch(r"20\d{2}", t) for t in tokens)
+    if coinciden and not pidio_anio:
+        anios = set()
+        for k in coinciden:
+            m = re.search(r"20\d{2}", k)
+            if m:
+                anios.add(m.group(0))
+        if len(anios) > 1:
+            reciente = max(anios)
+            coinciden = {k: v for k, v in coinciden.items() if reciente in k}
+    return coinciden
 
 
 def _buscar_cliente(nombre):
@@ -420,12 +454,7 @@ def buscar_tareas_cliente(cliente: str, mes: Optional[str] = None, con_video: bo
     todas_las_listas = _get_video_lists_dinamico()
 
     # Determinar en qué listas buscar
-    listas_a_buscar = {}
-    if mes:
-        mes_lower = mes.lower().strip()
-        for key, lid in todas_las_listas.items():
-            if mes_lower in key:
-                listas_a_buscar[key] = lid
+    listas_a_buscar = _filtrar_listas_por_mes(todas_las_listas, mes) if mes else {}
     if not listas_a_buscar:
         # Buscar en todas, más reciente primero
         listas_a_buscar = dict(reversed(list(todas_las_listas.items())))
@@ -536,9 +565,7 @@ def videos_listos_sin_copy(cliente: Optional[str] = None, mes: Optional[str] = N
 
     todas = _get_video_lists_dinamico()
 
-    if mes:
-        mes_lower = mes.lower().strip()
-        todas = {k: v for k, v in todas.items() if mes_lower in k.lower()}
+    todas = _filtrar_listas_por_mes(todas, mes)
 
     # Paso 1: fetch tareas de cada lista en paralelo (no comentarios todavía)
     def fetch_list(mes_key, list_id):
