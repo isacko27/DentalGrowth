@@ -248,7 +248,7 @@ def _execute_tool(name, input_data):
         body = input_data.get("body")
         try:
             if method == "GET":
-                r = httpx.get(url, timeout=30)
+                r = httpx.get(url, timeout=120)
             elif method == "POST":
                 r = httpx.post(url, json=body, timeout=120)
             elif method == "PUT":

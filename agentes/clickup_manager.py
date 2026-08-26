@@ -171,8 +171,8 @@ class AddCommentRequest(BaseModel):
 import threading as _threading
 
 _RATE_LOCK = _threading.Lock()
-_RATE_POR_SEG = 75.0 / 60.0
-_RATE_BURST = 10.0
+_RATE_POR_SEG = 90.0 / 60.0
+_RATE_BURST = 5.0
 _RATE_STATE = {"tokens": _RATE_BURST, "last": None}
 
 
@@ -530,7 +530,11 @@ VIDEO_READY_STATUSES = {
 # consulta sin filtros). Se cachea 10 min para que las consultas repetidas no
 # vuelvan a quemar el rate limit. Contrapartida: un video subido recien puede
 # tardar hasta 10 min en aparecer.
-_COMENTARIOS_TTL = 600
+# TTL asimetrico a proposito: si el editor YA subio el video, ese resultado no
+# va a cambiar, asi que se cachea varias horas. Si todavia no lo subio, hay que
+# volver a preguntar pronto para no tardar en verlo aparecer.
+_COMENTARIOS_TTL_CON_VIDEO = 6 * 3600
+_COMENTARIOS_TTL_SIN_VIDEO = 300
 _comentarios_cache = {}
 _comentarios_cache_lock = _threading.Lock()
 
@@ -539,8 +543,11 @@ def _get_video_de_comentarios_cached(task_id):
     ahora = _time.time()
     with _comentarios_cache_lock:
         hit = _comentarios_cache.get(task_id)
-        if hit and (ahora - hit[0]) < _COMENTARIOS_TTL:
-            return hit[1]
+        if hit:
+            guardado, video = hit
+            ttl = _COMENTARIOS_TTL_CON_VIDEO if video else _COMENTARIOS_TTL_SIN_VIDEO
+            if (ahora - guardado) < ttl:
+                return video
 
     comentarios = _clickup_get(
         f"https://api.clickup.com/api/v2/task/{task_id}/comment"
@@ -553,7 +560,7 @@ def _get_video_de_comentarios_cached(task_id):
 
 
 @app.get("/videos-listos-sin-copy")
-def videos_listos_sin_copy(cliente: Optional[str] = None, mes: Optional[str] = None):
+def videos_listos_sin_copy(cliente: Optional[str] = None, mes: Optional[str] = None, presupuesto_seg: float = 60.0):
     """Encuentra TODAS las tareas que tienen video subido por el editor pero todavía
     no tienen copy generado. PARALELIZADO para que no sea lento con muchas tareas.
 
@@ -562,6 +569,10 @@ def videos_listos_sin_copy(cliente: Optional[str] = None, mes: Optional[str] = N
     - mes: nombre del mes (ej "mayo")
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    # El presupuesto corre desde el arranque: traer las listas paginadas ya
+    # consume una parte grande del tiempo cuando no hay filtros.
+    limite = _time.monotonic() + presupuesto_seg
 
     todas = _get_video_lists_dinamico()
 
@@ -577,6 +588,13 @@ def videos_listos_sin_copy(cliente: Optional[str] = None, mes: Optional[str] = N
             return mes_key, data.get("tasks", [])
         except Exception:
             return mes_key, []
+
+    if _time.monotonic() > limite:
+        return {
+            "total": 0, "candidatos_chequeados": 0, "candidatos_totales": 0,
+            "listas_buscadas": list(todas.keys()), "pendientes": [], "truncado": True,
+            "aviso": "Se agoto el tiempo trayendo las listas. Filtra por cliente o mes.",
+        }
 
     candidatos = []  # (mes_key, task) tuples que requieren chequeo de comentarios
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(todas)))) as ex:
@@ -624,21 +642,45 @@ def videos_listos_sin_copy(cliente: Optional[str] = None, mes: Optional[str] = N
         except Exception:
             return None
 
+    # Cada candidato cuesta 1 request de comentarios y ClickUp solo permite 100
+    # por minuto, asi que una consulta sin filtros (miles de tareas) no entra en
+    # el tiempo de una request HTTP. Se trabaja con un presupuesto de tiempo y se
+    # avisa si quedo incompleto, en vez de devolver un listado corto en silencio.
     pendientes = []
+    chequeados = 0
     if candidatos:
-        with ThreadPoolExecutor(max_workers=min(15, len(candidatos))) as ex:
+        # Sin context manager a proposito: al salir de un "with" el executor
+        # espera a que terminen TODAS las tareas encoladas, asi que el corte por
+        # tiempo no serviria de nada. Hay que apagarlo cancelando lo pendiente.
+        ex = ThreadPoolExecutor(max_workers=min(15, len(candidatos)))
+        try:
             futures = [ex.submit(check_video, mk, t) for mk, t in candidatos]
             for fut in as_completed(futures):
+                chequeados += 1
                 result = fut.result()
                 if result:
                     pendientes.append(result)
+                if _time.monotonic() > limite:
+                    break
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
 
-    return {
+    truncado = chequeados < len(candidatos)
+    resultado = {
         "total": len(pendientes),
-        "candidatos_chequeados": len(candidatos),
+        "candidatos_chequeados": chequeados,
+        "candidatos_totales": len(candidatos),
         "listas_buscadas": list(todas.keys()),
         "pendientes": pendientes,
+        "truncado": truncado,
     }
+    if truncado:
+        resultado["aviso"] = (
+            f"Resultado PARCIAL: se alcanzo el limite de tiempo tras revisar "
+            f"{chequeados} de {len(candidatos)} tareas. Filtra por cliente o mes "
+            f"para obtener el listado completo."
+        )
+    return resultado
 
 
 @app.get("/tarea/{task_id}/copy")
