@@ -246,7 +246,11 @@ AGENT_NAMES = {
     "community_manager": "Community Manager",
 }
 
-client_ai = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+# max_retries por defecto es 2: con timeout de 180s eso son 3 intentos mas las
+# esperas entre medio, casi 15 minutos colgado si la API falla. El stream muere
+# antes y el browser lo muestra como "network error". Mejor fallar rapido y
+# contarlo, que el error termina como mensaje visible en el chat.
+client_ai = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, max_retries=1, timeout=90.0)
 
 
 DOWNLOAD_DIR = os.path.join(AGENTS_DIR, "_temp_videos")
@@ -618,7 +622,7 @@ def _call_claude_with_heartbeat(messages):
                 system=SYSTEM_PROMPT,
                 tools=TOOLS,
                 messages=messages,
-                timeout=180,
+                timeout=90,
             )
             result_queue.put(("ok", r))
         except Exception as e:
@@ -721,7 +725,12 @@ def _chat_stream(message: str):
         yield _sse_event("done", {"text": "Se alcanzó el límite de iteraciones."})
 
     except Exception as e:
-        yield _sse_event("done", {"text": f"Error: {str(e)}"})
+        yield _sse_event("done", {
+            "text": f"Se corto la operacion: {type(e).__name__}: {e}\n\n"
+                    "Si fue una busqueda amplia, filtra por cliente y mes "
+                    "(ej: \"videos sin copy de Dental Legacy en agosto\") — "
+                    "eso responde en pocos segundos."
+        })
 
 
 @app.post("/chat")
