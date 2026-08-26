@@ -6,3 +6,4 @@ anthropic
 assemblyai
 python-dotenv
 python-dateutil
+instagrapi

@@ -587,6 +587,50 @@ def _get_tool_response_event(block, result):
         return _sse_event("agent_response", {"agent": block.name, "response": str(result)[:200]})
 
 
+def _call_claude_with_heartbeat(messages):
+    """Llama a Claude en un thread aparte mandando heartbeats SSE mientras espera.
+
+    Sin esto el stream se queda sin mandar bytes durante toda la llamada al modelo
+    y el proxy de Railway corta la conexion (el browser lo reporta como "network error").
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    import queue
+
+    result_queue = queue.Queue()
+
+    def run():
+        try:
+            r = client_ai.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=2000,
+                system=SYSTEM_PROMPT,
+                tools=TOOLS,
+                messages=messages,
+                timeout=180,
+            )
+            result_queue.put(("ok", r))
+        except Exception as e:
+            result_queue.put(("error", e))
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(run)
+
+    while not future.done():
+        try:
+            future.result(timeout=10)
+        except Exception:
+            pass
+        if not future.done():
+            yield _sse_event("heartbeat", {"text": "\u23f3 Pensando..."})
+
+    executor.shutdown(wait=False)
+
+    status, data = result_queue.get()
+    if status == "error":
+        raise data
+    yield ("__RESULT__", data)
+
+
 def _chat_stream(message: str):
     """Generador SSE que procesa el chat con tool use."""
     chat_history.append({"role": "user", "content": message})
@@ -597,14 +641,14 @@ def _chat_stream(message: str):
         for _ in range(max_iterations):
             yield _sse_event("thinking", {"text": "Pensando..."})
 
-            response = client_ai.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=2000,
-                system=SYSTEM_PROMPT,
-                tools=TOOLS,
-                messages=messages,
-                timeout=600,
-            )
+            response = None
+            for event in _call_claude_with_heartbeat(messages):
+                if isinstance(event, tuple) and event[0] == "__RESULT__":
+                    response = event[1]
+                else:
+                    yield event
+            if response is None:
+                raise RuntimeError("No se obtuvo respuesta del modelo")
 
             # Si terminó sin tool use
             if response.stop_reason == "end_of_turn":

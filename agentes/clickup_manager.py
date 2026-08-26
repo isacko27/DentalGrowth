@@ -163,20 +163,69 @@ class AddCommentRequest(BaseModel):
 # HELPERS INTERNOS
 # ============================================================
 
-def _clickup_get(url, params=None):
-    response = requests.get(url, headers=headers, params=params)
+# ClickUp permite 100 requests/minuto por token. Los endpoints que chequean
+# cientos de tareas en paralelo se pasaban de ese limite y los 429 se tragaban
+# silenciosamente, devolviendo listados incompletos (52 videos una vez, 0 la
+# siguiente). Este throttle compartido mantiene el ritmo por debajo del limite.
+import threading as _threading
+
+_RATE_LOCK = _threading.Lock()
+_RATE_POR_SEG = 75.0 / 60.0
+_RATE_BURST = 10.0
+_RATE_STATE = {"tokens": _RATE_BURST, "last": None}
+
+
+def _rate_limit_wait():
+    import time as _t
+    while True:
+        with _RATE_LOCK:
+            ahora = _t.monotonic()
+            if _RATE_STATE["last"] is None:
+                _RATE_STATE["last"] = ahora
+            transcurrido = ahora - _RATE_STATE["last"]
+            _RATE_STATE["last"] = ahora
+            _RATE_STATE["tokens"] = min(
+                _RATE_BURST, _RATE_STATE["tokens"] + transcurrido * _RATE_POR_SEG
+            )
+            if _RATE_STATE["tokens"] >= 1.0:
+                _RATE_STATE["tokens"] -= 1.0
+                return
+            faltante = 1.0 - _RATE_STATE["tokens"]
+            esperar = faltante / _RATE_POR_SEG
+        _t.sleep(min(esperar, 5.0))
+
+
+def _clickup_request(method, url, params=None, body=None, intentos=4):
+    """Request a ClickUp respetando el rate limit y reintentando los 429."""
+    import time as _t
+    response = None
+    for intento in range(intentos):
+        _rate_limit_wait()
+        response = requests.request(
+            method, url, headers=headers, params=params, json=body, timeout=30
+        )
+        if response.status_code == 429:
+            espera = response.headers.get("Retry-After")
+            try:
+                espera = float(espera)
+            except (TypeError, ValueError):
+                espera = 2 ** intento
+            _t.sleep(min(espera, 30))
+            continue
+        response.raise_for_status()
+        return response.json()
     response.raise_for_status()
     return response.json()
+
+
+def _clickup_get(url, params=None):
+    return _clickup_request("GET", url, params=params)
 
 def _clickup_post(url, body):
-    response = requests.post(url, headers=headers, json=body)
-    response.raise_for_status()
-    return response.json()
+    return _clickup_request("POST", url, body=body)
 
 def _clickup_put(url, body):
-    response = requests.put(url, headers=headers, json=body)
-    response.raise_for_status()
-    return response.json()
+    return _clickup_request("PUT", url, body=body)
 
 import time as _time
 _video_lists_cache = {"data": None, "timestamp": 0}
@@ -419,6 +468,32 @@ VIDEO_READY_STATUSES = {
 }
 
 
+# Chequear los comentarios de cada tarea es 1 request por tarea (cientos en una
+# consulta sin filtros). Se cachea 10 min para que las consultas repetidas no
+# vuelvan a quemar el rate limit. Contrapartida: un video subido recien puede
+# tardar hasta 10 min en aparecer.
+_COMENTARIOS_TTL = 600
+_comentarios_cache = {}
+_comentarios_cache_lock = _threading.Lock()
+
+
+def _get_video_de_comentarios_cached(task_id):
+    ahora = _time.time()
+    with _comentarios_cache_lock:
+        hit = _comentarios_cache.get(task_id)
+        if hit and (ahora - hit[0]) < _COMENTARIOS_TTL:
+            return hit[1]
+
+    comentarios = _clickup_get(
+        f"https://api.clickup.com/api/v2/task/{task_id}/comment"
+    ).get("comments", [])
+    video = _buscar_video_en_comentarios(comentarios)
+
+    with _comentarios_cache_lock:
+        _comentarios_cache[task_id] = (ahora, video)
+    return video
+
+
 @app.get("/videos-listos-sin-copy")
 def videos_listos_sin_copy(cliente: Optional[str] = None, mes: Optional[str] = None):
     """Encuentra TODAS las tareas que tienen video subido por el editor pero todavía
@@ -479,10 +554,7 @@ def videos_listos_sin_copy(cliente: Optional[str] = None, mes: Optional[str] = N
     # Paso 2: chequeo de comentarios EN PARALELO (esto era el N+1 problem)
     def check_video(mes_key, t):
         try:
-            comentarios = _clickup_get(
-                f"https://api.clickup.com/api/v2/task/{t['id']}/comment"
-            ).get("comments", [])
-            video = _buscar_video_en_comentarios(comentarios)
+            video = _get_video_de_comentarios_cached(t["id"])
             if not video:
                 return None
             return {
