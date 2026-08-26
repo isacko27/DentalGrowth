@@ -219,7 +219,36 @@ def _clickup_request(method, url, params=None, body=None, intentos=4):
 
 
 def _clickup_get(url, params=None):
-    return _clickup_request("GET", url, params=params)
+    """GET a ClickUp. Si es un listado de tareas, junta TODAS las paginas.
+
+    ClickUp devuelve como maximo 100 tareas por pagina. El codigo leia solo la
+    primera, asi que en listas grandes las tareas de mas abajo eran invisibles
+    (agosto 2026 tiene 195 tareas: las 5 de Dental Legacy caian en la pagina 2 y
+    el bot respondia que no habia videos sin copy).
+    """
+    es_listado = url.rstrip("/").endswith("/task")
+    ya_pide_pagina = bool(params) and "page" in params
+    if not es_listado or ya_pide_pagina:
+        return _clickup_request("GET", url, params=params)
+
+    tareas = []
+    data = {}
+    pagina = 0
+    while True:
+        page_params = dict(params or {})
+        page_params["page"] = pagina
+        data = _clickup_request("GET", url, params=page_params)
+        lote = data.get("tasks", [])
+        tareas.extend(lote)
+        if data.get("last_page") or not lote:
+            break
+        pagina += 1
+        if pagina > 50:  # tope de seguridad
+            break
+
+    data = dict(data)
+    data["tasks"] = tareas
+    return data
 
 def _clickup_post(url, body):
     return _clickup_request("POST", url, body=body)
