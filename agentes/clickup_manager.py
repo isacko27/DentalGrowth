@@ -41,11 +41,14 @@ WORKSPACE = {
         "abril_2026": "901326704541",
         "mayo_2026": "901327032239",
     },
+    # Copiados tal cual estan en ClickUp, CON tildes. Se exponen por
+    # GET /video-statuses y se usan para cambiar el estado de una tarea, asi que
+    # si aca faltan los acentos ClickUp rechaza el cambio.
     "video_statuses": [
-        "to do", "grabado", "en edicion",
-        "en revision (agencia)", "pendiente de correccion",
-        "aprobado (agencia)", "en revision (cliente)",
-        "completado", "subido a campanas", "pagado"
+        "to do", "grabado", "en edición",
+        "en revisión (agencia)", "pendiente de corrección",
+        "aprobado (agencia)", "en revisión (cliente)",
+        "completado", "subido a campañas", "pagado"
     ],
     "editores": [
         {"name": "jano kukita", "id": 106036418, "email": "janokukita@gmail.com"},
@@ -57,7 +60,7 @@ WORKSPACE = {
         "entrega_servicio": "901323251880",
     },
     "admin_statuses": {
-        "pagos": ["sin iniciar", "activo", "pendiente de pago", "atrasado", "paquete unico", "trimestral", "pausado", "negociación", "no paga"],
+        "pagos": ["sin iniciar", "mensualidad bots", "activo", "pendiente de pago", "atrasado", "paquete unico", "trimestral", "pausado", "negociación", "no paga"],
         "tareas": ["pendiente", "en curso", "completada", "cerrada"],
     },
     "admin_fields": {
@@ -519,10 +522,25 @@ def buscar_tareas_cliente(cliente: str, mes: Optional[str] = None, con_video: bo
 
 
 # Statuses donde el editor YA subió video (filtro inicial para evitar N+1 problem)
+# Los status se escriben con tildes y eñes en ClickUp ("en revisión (cliente)",
+# "pendiente de corrección", "subido a campañas") pero aca estaban sin acentos,
+# asi que la comparacion fallaba y esas tareas se descartaban en silencio: los 6
+# videos de Karina en setiembre existian pero el bot decia que no habia ninguno.
+# Se comparan siempre normalizados.
+def _sin_acentos(texto):
+    import unicodedata
+    return "".join(
+        c for c in unicodedata.normalize("NFD", (texto or "").lower().strip())
+        if unicodedata.category(c) != "Mn"
+    )
+
+
 VIDEO_READY_STATUSES = {
-    "en revision (agencia)", "pendiente de correccion",
-    "aprobado (agencia)", "en revision (cliente)",
-    "completado", "subido a campanas", "pagado",
+    _sin_acentos(x) for x in {
+        "en revision (agencia)", "pendiente de correccion",
+        "aprobado (agencia)", "en revision (cliente)",
+        "completado", "subido a campanas", "pagado",
+    }
 }
 
 
@@ -619,7 +637,7 @@ def videos_listos_sin_copy(cliente: Optional[str] = None, mes: Optional[str] = N
                     continue
 
                 # Filtro por status: solo tareas donde el editor ya subió video
-                status = t.get("status", {}).get("status", "").lower()
+                status = _sin_acentos(t.get("status", {}).get("status", ""))
                 if status not in VIDEO_READY_STATUSES:
                     continue
 
@@ -947,10 +965,14 @@ def get_pagos_cliente(cliente: str):
 def set_pago_status(req: SetStatusRequest):
     """Cambia el estado de pago de un cliente."""
     valid = WORKSPACE["admin_statuses"]["pagos"]
-    if req.status.lower() not in valid:
+    # Se acepta con o sin tildes y se manda a ClickUp el valor canonico, que si
+    # las lleva ("negociación"): mandarlo sin acento hace que ClickUp lo rechace.
+    pedido = _sin_acentos(req.status)
+    canonico = next((v for v in valid if _sin_acentos(v) == pedido), None)
+    if canonico is None:
         raise HTTPException(status_code=400, detail=f"Status inválido. Opciones: {valid}")
     url = f"https://api.clickup.com/api/v2/task/{req.task_id}"
-    response = requests.put(url, headers=headers, json={"status": req.status.lower()})
+    response = requests.put(url, headers=headers, json={"status": canonico})
     return {"success": response.status_code == 200, "status_code": response.status_code}
 
 
