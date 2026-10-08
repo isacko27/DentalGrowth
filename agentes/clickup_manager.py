@@ -339,12 +339,16 @@ def _filtrar_listas_por_mes(listas, mes):
 
 def _buscar_cliente(nombre):
     """Busca un cliente por nombre (match flexible)."""
-    nombre_lower = nombre.lower().strip()
+    nombre_lower = _sin_acentos(nombre)
+    sin_espacios = nombre_lower.replace(" ", "")
     for key, data in WORKSPACE["clientes"].items():
-        if nombre_lower in key or key in nombre_lower:
+        key_norm = _sin_acentos(key)
+        if nombre_lower in key_norm or key_norm in nombre_lower:
             return {**data, "key": key}
-        palabras = nombre_lower.split()
-        if len(palabras) >= 2 and all(p in key for p in palabras):
+        if sin_espacios and sin_espacios in key_norm.replace(" ", ""):
+            return {**data, "key": key}
+        palabras = [p for p in nombre_lower.split() if p]
+        if len(palabras) >= 2 and all(p in key_norm for p in palabras):
             return {**data, "key": key}
     return None
 
@@ -354,6 +358,18 @@ def _extraer_nombre_cliente(nombre_tarea):
     nombre = nombre_tarea.rsplit("#", 1)[0].strip()
     nombre = re.sub(r'\s+\d+$', '', nombre).strip()
     return nombre
+
+def _nombre_desde_url(url):
+    """Nombre de archivo a partir de una URL, sin querystring.
+
+    Las URLs de adjuntos terminan en "...Orto%20Tandem%236.mov?view=open": si no
+    se corta el "?view=open" la comprobacion de extension falla.
+    """
+    if not url:
+        return ""
+    from urllib.parse import urlparse, unquote
+    return unquote(urlparse(url).path.split("/")[-1])
+
 
 def _buscar_video_en_comentarios(comentarios):
     """Busca el último video subido por un editor en los comentarios."""
@@ -386,15 +402,22 @@ def _buscar_video_en_comentarios(comentarios):
                     url_archivo = frame.get("url", "") or frame.get("src", "")
                     nombre_archivo = frame.get("id", "")
                     if not nombre_archivo and url_archivo:
-                        from urllib.parse import urlparse, unquote
-                        path = urlparse(url_archivo).path
-                        nombre_archivo = unquote(path.split("/")[-1])
+                        nombre_archivo = _nombre_desde_url(url_archivo)
 
                 # Tipo "attachment"
                 attachment = block.get("attachment", {})
                 if attachment:
                     url_archivo = attachment.get("url", "")
                     nombre_archivo = attachment.get("title", "") or attachment.get("name", "")
+
+                # Tipo "link_preview" — asi llegan los videos que el editor pega
+                # como enlace en vez de arrastrarlos. Sigue siendo un adjunto de
+                # ClickUp, solo que en otro tipo de bloque; sin esto los videos
+                # de octubre existian pero el bot no los veia.
+                link_preview = block.get("link_preview", {})
+                if link_preview:
+                    url_archivo = link_preview.get("url", "") or url_archivo
+                    nombre_archivo = _nombre_desde_url(url_archivo)
 
                 if url_archivo and nombre_archivo:
                     if any(nombre_archivo.lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
@@ -474,12 +497,8 @@ def buscar_tareas_cliente(cliente: str, mes: Optional[str] = None, con_video: bo
 
         for t in data.get("tasks", []):
             nombre_tarea = t["name"].lower()
-            # Match flexible: el nombre del cliente aparece en el nombre de la tarea
-            if cliente_lower not in nombre_tarea:
-                # Intentar con palabras individuales
-                palabras = cliente_lower.split()
-                if not all(p in nombre_tarea for p in palabras):
-                    continue
+            if not _coincide_cliente(t["name"], cliente):
+                continue
 
             # Extraer info del campo "tema" (copy)
             copy = None
@@ -533,6 +552,28 @@ def _sin_acentos(texto):
         c for c in unicodedata.normalize("NFD", (texto or "").lower().strip())
         if unicodedata.category(c) != "Mn"
     )
+
+
+def _coincide_cliente(nombre_tarea, cliente):
+    """¿La tarea pertenece a este cliente? Tolerante a tildes y espacios.
+
+    Las tareas se llaman "Orto Tándem #6" pero la gente escribe "ortotandem",
+    sin tilde y sin espacio. Comparando crudo no coincidia y el bot respondia que
+    no habia videos, aunque hubiera decenas.
+    """
+    if not cliente:
+        return True
+    tarea = _sin_acentos(nombre_tarea)
+    buscado = _sin_acentos(cliente)
+    if not buscado:
+        return True
+    if buscado in tarea:
+        return True
+    # "ortotandem" tiene que encontrar "Orto Tandem"
+    if buscado.replace(" ", "") in tarea.replace(" ", ""):
+        return True
+    palabras = [p for p in buscado.split() if p]
+    return bool(palabras) and all(p in tarea for p in palabras)
 
 
 VIDEO_READY_STATUSES = {
@@ -621,12 +662,8 @@ def videos_listos_sin_copy(cliente: Optional[str] = None, mes: Optional[str] = N
             mes_key, tasks = fut.result()
             for t in tasks:
                 nombre_tarea = t["name"]
-                if cliente:
-                    cliente_lower = cliente.lower().strip()
-                    if cliente_lower not in nombre_tarea.lower():
-                        palabras = cliente_lower.split()
-                        if not all(p in nombre_tarea.lower() for p in palabras):
-                            continue
+                if cliente and not _coincide_cliente(nombre_tarea, cliente):
+                    continue
 
                 # ¿Ya tiene copy?
                 tiene_copy = any(
